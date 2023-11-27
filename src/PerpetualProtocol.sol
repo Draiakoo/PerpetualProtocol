@@ -16,6 +16,8 @@ contract PerpetualProtocol is ERC4626 {
     error InvalidValues();
     error NonExistingPosition();
     error StalePrice();
+    error LeverageExceeded();
+    error NotEnoughLiquidity();
 
     struct Position {
         bool isOpen;
@@ -73,6 +75,8 @@ contract PerpetualProtocol is ERC4626 {
     
     // For liquidity providers
     function depositLiquidity(uint256 amountOfUsdc) external {
+        emit DEBUG(totalSupply());
+        emit DEBUG(totalAssets());
         deposit(amountOfUsdc, msg.sender);
     }
 
@@ -94,14 +98,9 @@ contract PerpetualProtocol is ERC4626 {
         uint256 normalizedIndex = amountToBorrow * normalizingDecimalsIndex;
         uint256 currentIndexPrice = getIndexPrice();
         // @notice amountToBorrow is in index token decimals, currentIndexPrice also
-        if(
-            amountOfCollateral == 0 || 
-            amountToBorrow == 0 || 
-            // normalizedIndex * currentIndexPrice > normalizedCollateral * maxLeverage ||
-            normalizedIndex * currentIndexPrice > getUsableLiquidity() * 1 ether
-        ){
-            revert InvalidValues();
-        }
+        if(amountOfCollateral == 0 || amountToBorrow == 0) revert InvalidValues();
+        if(normalizedIndex * currentIndexPrice > normalizedCollateral * maxLeverage) revert LeverageExceeded();
+        if(normalizedIndex * currentIndexPrice > getUsableLiquidity() * 1 ether) revert NotEnoughLiquidity();
 
         SafeERC20.safeTransferFrom(collateralToken, msg.sender, address(this), amountOfCollateral);
 
@@ -127,6 +126,7 @@ contract PerpetualProtocol is ERC4626 {
     }
 
     function increasePositionSize(uint256 newAmountOfAssetsToBorrow) external existingPosition(msg.sender){
+        if(newAmountOfAssetsToBorrow == 0) revert InvalidValues();
         uint256 oldAmountUnderlyingAssets = positions[msg.sender].borrowedAmountUnderlyingToken;
         uint256 oldPrice = positions[msg.sender].priceWhenBorrowed;
         uint256 currentIndexPrice = getIndexPrice();
@@ -148,12 +148,9 @@ contract PerpetualProtocol is ERC4626 {
             uint256 collateral = pnl < 0 ? positions[msg.sender].collateralAmount - uint256(pnl) : positions[msg.sender].collateralAmount;
             leverage = newBorrowedPrice * (oldAmountUnderlyingAssets + normalizedNewBorrow) / collateral;
         }
-        if(
-            normalizedNewBorrow * currentIndexPrice > getUsableLiquidity() ||
-            leverage > maxLeverage
-        ){
-            revert InvalidValues();
-        }
+        emit DEBUG(getUsableLiquidity());
+        if(normalizedNewBorrow * currentIndexPrice > getUsableLiquidity() * 1 ether) revert NotEnoughLiquidity();
+        if(leverage > maxLeverage) revert LeverageExceeded();
         positions[msg.sender].borrowedAmountUnderlyingToken = oldAmountUnderlyingAssets + normalizedNewBorrow;
         positions[msg.sender].priceWhenBorrowed = newBorrowedPrice;
     }
