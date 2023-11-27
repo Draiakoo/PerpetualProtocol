@@ -3,30 +3,12 @@
 pragma solidity 0.8.20;
 
 import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC20Custom, AggregatorV3Interface} from "./Interfaces.sol";
 
-
-interface AggregatorV3Interface {
-    function decimals() external view returns (uint8);
-
-    function description() external view returns (string memory);
-
-    function version() external view returns (uint256);
-
-    function getRoundData(uint80 _roundId)
-        external
-        view
-        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
-
-    function latestRoundData()
-        external
-        view
-        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
-}
-
-contract PerpetualProtocol is ERC4626{
+contract PerpetualProtocol is ERC4626 {
 
     using SafeERC20 for IERC20;
 
@@ -49,6 +31,9 @@ contract PerpetualProtocol is ERC4626{
     IERC20 public immutable indexToken;
     address public immutable indexTokenPriceFeed;
     uint256 public immutable priceFeedHeartbeat;
+    uint256 public immutable normalizingDecimalsCollateral;
+    uint256 public immutable normalizingDecimalsIndex;
+    uint256 public immutable normalizingDecimalsDataFeedIndex;
     mapping(address trader => Position position) public positions;
     uint256 public totalAmountBorrowedShorts;
     uint256 public averagePriceShorts;
@@ -63,6 +48,7 @@ contract PerpetualProtocol is ERC4626{
     }
 
     constructor(
+        // leverage must be in wad units. Eg. if maxLeverage is 15x, this immutable will be 15_00000000_0000000000
         uint256 _maxLeverage,
         uint256 _utilizationCap,
         IERC20 _collateralToken,
@@ -70,7 +56,7 @@ contract PerpetualProtocol is ERC4626{
         address _indexTokenPriceFeed,
         uint256 _priceFeedHeartbeat
     ) 
-        ERC4626(_indexToken)
+        ERC4626(_collateralToken)
         ERC20("PerpShares", "PS")
     {
         utilizationCap = _utilizationCap;
@@ -79,31 +65,40 @@ contract PerpetualProtocol is ERC4626{
         indexToken = _indexToken;
         indexTokenPriceFeed = _indexTokenPriceFeed;
         priceFeedHeartbeat = _priceFeedHeartbeat;
+        // It is assumed that decimals for both tokens and data feed are below or equal to 18
+        normalizingDecimalsCollateral = 10 ** (18 - IERC20Custom(address(_collateralToken)).decimals());
+        normalizingDecimalsIndex = 10 ** (18 - IERC20Custom(address(_indexToken)).decimals());
+        normalizingDecimalsDataFeedIndex = 10 ** (18 - AggregatorV3Interface(_indexTokenPriceFeed).decimals());
     }
     
     // For liquidity providers
-    function depositLiquidity(uint256 amountOfWbtc) external {
-        deposit(amountOfWbtc, msg.sender);
+    function depositLiquidity(uint256 amountOfUsdc) external {
+        deposit(amountOfUsdc, msg.sender);
     }
 
     function withdrawLiquidity(uint256 amountOfShares) external {
         redeem(amountOfShares, msg.sender, msg.sender);
     }
 
+    event DEBUG(uint256);
+    event DEBUG2(int256);
 
     // For traders
 
+    // amountOfCollateral and amountToBorrow must be in their own decimals
     function openPosition(bool _isShort, uint256 amountOfCollateral, uint256 amountToBorrow) external {
         if(positions[msg.sender].isOpen){
             revert PositionAlreadyExisting();
         }
+        uint256 normalizedCollateral = amountOfCollateral * normalizingDecimalsCollateral;
+        uint256 normalizedIndex = amountToBorrow * normalizingDecimalsIndex;
         uint256 currentIndexPrice = getIndexPrice();
         // @notice amountToBorrow is in index token decimals, currentIndexPrice also
         if(
             amountOfCollateral == 0 || 
             amountToBorrow == 0 || 
-            amountToBorrow * currentIndexPrice > amountOfCollateral * maxLeverage ||
-            amountToBorrow * currentIndexPrice > getUsableLiquidity()
+            // normalizedIndex * currentIndexPrice > normalizedCollateral * maxLeverage ||
+            normalizedIndex * currentIndexPrice > getUsableLiquidity() * 1 ether
         ){
             revert InvalidValues();
         }
@@ -112,53 +107,54 @@ contract PerpetualProtocol is ERC4626{
 
         positions[msg.sender] = Position({
             isOpen: true,
-            collateralAmount: amountOfCollateral,
-            borrowedAmountUnderlyingToken: amountToBorrow,
+            collateralAmount: normalizedCollateral,
+            borrowedAmountUnderlyingToken: normalizedIndex,
             priceWhenBorrowed: currentIndexPrice,
             isShort: _isShort
         });
 
         if(_isShort){
-            averagePriceShorts = (totalAmountBorrowedShorts * averagePriceShorts + amountToBorrow * getIndexPrice()) / (totalAmountBorrowedShorts + amountToBorrow);
-            totalAmountBorrowedShorts += amountToBorrow;
+            averagePriceShorts = (totalAmountBorrowedShorts * averagePriceShorts + normalizedIndex * getIndexPrice()) / (totalAmountBorrowedShorts + normalizedIndex);
+            totalAmountBorrowedShorts += normalizedIndex;
         } else {
-            averagePriceLongs = (totalAmountBorrowedLongs * averagePriceLongs + amountToBorrow * getIndexPrice()) / (totalAmountBorrowedLongs + amountToBorrow);
-            totalAmountBorrowedLongs += amountToBorrow;
+            averagePriceLongs = (totalAmountBorrowedLongs * averagePriceLongs + normalizedIndex * getIndexPrice()) / (totalAmountBorrowedLongs + normalizedIndex);
+            totalAmountBorrowedLongs += normalizedIndex;
         }
     }
     function increaseCollateral(uint256 collateralIncrease) external existingPosition(msg.sender){
         SafeERC20.safeTransferFrom(collateralToken, msg.sender, address(this), collateralIncrease);
-        positions[msg.sender].collateralAmount += collateralIncrease;
+        positions[msg.sender].collateralAmount += collateralIncrease * normalizingDecimalsCollateral;
     }
 
     function increasePositionSize(uint256 newAmountOfAssetsToBorrow) external existingPosition(msg.sender){
         uint256 oldAmountUnderlyingAssets = positions[msg.sender].borrowedAmountUnderlyingToken;
         uint256 oldPrice = positions[msg.sender].priceWhenBorrowed;
         uint256 currentIndexPrice = getIndexPrice();
-        uint256 newBorrowedPrice = (oldAmountUnderlyingAssets * oldPrice + newAmountOfAssetsToBorrow * currentIndexPrice) / (oldAmountUnderlyingAssets + newAmountOfAssetsToBorrow);
+        uint256 normalizedNewBorrow = newAmountOfAssetsToBorrow * normalizingDecimalsIndex;
+        uint256 newBorrowedPrice = (oldAmountUnderlyingAssets * oldPrice + normalizedNewBorrow * currentIndexPrice) / (oldAmountUnderlyingAssets + normalizedNewBorrow);
         uint256 leverage;
         if(positions[msg.sender].isShort){
-            uint256 newAveragePriceShorts = (totalAmountBorrowedShorts * averagePriceShorts + newAmountOfAssetsToBorrow * currentIndexPrice) / (totalAmountBorrowedShorts + newAmountOfAssetsToBorrow);
-            totalAmountBorrowedShorts += newAmountOfAssetsToBorrow;
+            uint256 newAveragePriceShorts = (totalAmountBorrowedShorts * averagePriceShorts + normalizedNewBorrow * currentIndexPrice) / (totalAmountBorrowedShorts + normalizedNewBorrow);
+            totalAmountBorrowedShorts += normalizedNewBorrow;
             averagePriceShorts = newAveragePriceShorts;
-            int256 pnl = (int256(newAveragePriceShorts) - int256(currentIndexPrice)) * int256(oldAmountUnderlyingAssets + newAmountOfAssetsToBorrow);
+            int256 pnl = (int256(newAveragePriceShorts) - int256(currentIndexPrice)) * int256(oldAmountUnderlyingAssets + normalizedNewBorrow);
             uint256 collateral = pnl < 0 ? positions[msg.sender].collateralAmount - uint256(pnl) : positions[msg.sender].collateralAmount;
-            leverage = newBorrowedPrice * (oldAmountUnderlyingAssets + newAmountOfAssetsToBorrow) / collateral;
+            leverage = newBorrowedPrice * (oldAmountUnderlyingAssets + normalizedNewBorrow) / collateral;
         } else {
-            uint256 newAveragePriceLongs = (totalAmountBorrowedLongs * averagePriceLongs + newAmountOfAssetsToBorrow * currentIndexPrice) / (totalAmountBorrowedLongs + newAmountOfAssetsToBorrow);
-            totalAmountBorrowedLongs += newAmountOfAssetsToBorrow;
+            uint256 newAveragePriceLongs = (totalAmountBorrowedLongs * averagePriceLongs + normalizedNewBorrow * currentIndexPrice) / (totalAmountBorrowedLongs + normalizedNewBorrow);
+            totalAmountBorrowedLongs += normalizedNewBorrow;
             averagePriceLongs = newAveragePriceLongs;
-            int256 pnl = (int256(currentIndexPrice) - int256(newAveragePriceLongs)) * int256(oldAmountUnderlyingAssets + newAmountOfAssetsToBorrow);
+            int256 pnl = (int256(currentIndexPrice) - int256(newAveragePriceLongs)) * int256(oldAmountUnderlyingAssets + normalizedNewBorrow);
             uint256 collateral = pnl < 0 ? positions[msg.sender].collateralAmount - uint256(pnl) : positions[msg.sender].collateralAmount;
-            leverage = newBorrowedPrice * (oldAmountUnderlyingAssets + newAmountOfAssetsToBorrow) / collateral;
+            leverage = newBorrowedPrice * (oldAmountUnderlyingAssets + normalizedNewBorrow) / collateral;
         }
         if(
-            newAmountOfAssetsToBorrow * currentIndexPrice > getUsableLiquidity() ||
+            normalizedNewBorrow * currentIndexPrice > getUsableLiquidity() ||
             leverage > maxLeverage
         ){
             revert InvalidValues();
         }
-        positions[msg.sender].borrowedAmountUnderlyingToken = oldAmountUnderlyingAssets + newAmountOfAssetsToBorrow;
+        positions[msg.sender].borrowedAmountUnderlyingToken = oldAmountUnderlyingAssets + normalizedNewBorrow;
         positions[msg.sender].priceWhenBorrowed = newBorrowedPrice;
     }
 
@@ -172,7 +168,7 @@ contract PerpetualProtocol is ERC4626{
             revert StalePrice();
         }
 
-        return uint256(price);
+        return uint256(price) * normalizingDecimalsDataFeedIndex;
     }
 
     function getUsableLiquidity() public view returns(uint256){
@@ -188,6 +184,6 @@ contract PerpetualProtocol is ERC4626{
         uint256 currentIndexPrice = getIndexPrice();
         int256 pnlShorts = int256(totalAmountBorrowedShorts) * (int256(averagePriceShorts) - int256(currentIndexPrice));
         int256 pnlLongs = int256(totalAmountBorrowedLongs) * (int256(currentIndexPrice) - int256(averagePriceLongs));
-        return uint256(int256(collateralToken.balanceOf(address(this)) * utilizationCap / 100) + pnlLongs + pnlShorts);
+        return uint256(int256(collateralToken.balanceOf(address(this)) * normalizingDecimalsCollateral * utilizationCap / 100) + pnlLongs + pnlShorts);
     }
 }

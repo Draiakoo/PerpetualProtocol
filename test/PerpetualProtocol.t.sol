@@ -43,21 +43,32 @@ contract PerpetualProtocolTest is Test {
     address public liquidityProvider = makeAddr("liquidityProvider");
     address public trader = makeAddr("trader");
 
-    uint256 public constant WTB_DECIMALS = 10 ** 8;
+    uint256 public constant WBTC_DECIMALS = 10 ** 8;
+    uint256 public constant USDC_DECIMALS = 10 ** 6;
 
     function setUp() public {
-        oracle = new MockOracle(8, int256(10_000 * WTB_DECIMALS));
+        oracle = new MockOracle(8, int256(10_000 * WBTC_DECIMALS));
         usdcMock = new ERC20Mock(6, "USDC", "USDC");
         wbtcMock = new ERC20Mock(8, "Wrapped Bitcoin", "WBTC");
         protocol = new PerpetualProtocol(15 ether, 80, IERC20(address(usdcMock)), IERC20(address(wbtcMock)), address(oracle), 1 days);
-        usdcMock.mint(trader, 100_000 * 10 ** 6);
+        usdcMock.mint(liquidityProvider, 100_000 * USDC_DECIMALS);
+        usdcMock.mint(trader, 100_000 * USDC_DECIMALS);
+
+        skip(100 days);
 
         // Initial price for WBTC 30.000 USDC
-        oracle.updatePrice(int256(30_000 * WTB_DECIMALS));
+        oracle.updatePrice(int256(30_000 * WBTC_DECIMALS));
+    }
+
+    function testDepositOfLiquidity() public {
+        vm.startPrank(liquidityProvider);
+        usdcMock.approve(address(protocol), 100_000 * USDC_DECIMALS);
+        protocol.depositLiquidity(100_000 * USDC_DECIMALS);
+        vm.stopPrank();
     }
 
     function testOpenPositionReverts() public {
-        provideLiquidity(100 * WTB_DECIMALS);        // 100 WBTC
+        provideLiquidity(100_000 * USDC_DECIMALS);        // 100.000 $ but only 80.000 $ usable
 
         vm.startPrank(trader);
         // Revert when collateral or borrowing amount is 0
@@ -67,9 +78,25 @@ contract PerpetualProtocolTest is Test {
         vm.expectRevert(PerpetualProtocol.InvalidValues.selector);
         protocol.openPosition(false, 100_000 * 10 ** 6, 0);
 
+        // Revert when leverage is greater than 15
+        usdcMock.approve(address(protocol), 1_500 * USDC_DECIMALS);
+        vm.expectRevert(PerpetualProtocol.InvalidValues.selector);
+        protocol.openPosition(false, 1_500 * USDC_DECIMALS, 1 * WBTC_DECIMALS);       // 1 BTC @ 30.000 $ -> 30.000 $, leverage 20
 
-        // usdcMock.approve(address(protocol));
+        // Revert when there is not enough available liquidity
+        usdcMock.approve(address(protocol), 7_000 * USDC_DECIMALS);
+        vm.expectRevert(PerpetualProtocol.InvalidValues.selector);
+        protocol.openPosition(false, 7_000 * USDC_DECIMALS, 3 * WBTC_DECIMALS);         // 3 BTC @ 30.000 $ -> 90.000 $, but available liquidity is 80.000$
+        
 
+    }
+
+    function testOpenPositionSuccess() public {
+        provideLiquidity(100_000 * USDC_DECIMALS);        // 100.000 $ but only 80.000 $ usable
+        vm.startPrank(trader);
+        usdcMock.approve(address(protocol), 7_000 * USDC_DECIMALS);
+        protocol.openPosition(false, 7_000 * USDC_DECIMALS, 1 * WBTC_DECIMALS); // 1 BTC @ 30.000 -> leverage 4.3
+        vm.stopPrank();
     }
 
     function testNotEnoughLiquidity() public {}
@@ -83,9 +110,9 @@ contract PerpetualProtocolTest is Test {
     //////////////////////////////////////////////////////////////
 
     function provideLiquidity(uint256 amount) internal {
-        wbtcMock.mint(liquidityProvider, amount);
+        usdcMock.mint(liquidityProvider, amount);
         vm.startPrank(liquidityProvider);
-        wbtcMock.approve(address(protocol), amount);
+        usdcMock.approve(address(protocol), amount);
         protocol.depositLiquidity(amount);
         vm.stopPrank();
     }
